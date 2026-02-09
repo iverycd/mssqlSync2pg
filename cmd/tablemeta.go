@@ -1,0 +1,499 @@
+package cmd
+
+import (
+	"fmt"
+	"github.com/spf13/viper"
+	"strconv"
+	"strings"
+	"time"
+)
+
+var tabRet []string
+var tableCount int
+var failedCount int
+
+type Database interface {
+	// TableCreate (logDir string, tableMap map[string][]string) (result []string) 单线程
+	TableCreate(logDir string, tblName string, ch chan struct{})
+	SeqCreate(logDir string) (result []string)
+	IdxCreate(logDir string, excludeTable []string) (result []string)
+	ViewCreate(logDir string) (result []string)
+	FKCreate(logDir string) (result []string)
+	TriggerCreate(logDir string) (result []string)
+}
+
+type Table struct {
+	columnName             string
+	dataType               string
+	characterMaximumLength string
+	isNullable             string
+	columnDefault          string
+	numericPrecision       string
+	numericScale           string
+	datetimePrecision      string
+	columnKey              string
+	columnComment          string
+	ordinalPosition        int
+	destType               string
+	destNullable           string
+	destDefault            string
+	autoIncrement          int
+	destSeqSql             string
+	destDefaultSeq         string
+	dropSeqSql             string
+	destIdxSql             string
+	viewSql                string
+}
+
+func (tb *Table) TableCreate(logDir string, tblName string, ch chan struct{}) {
+	defer wg2.Done()
+	var newTable Table
+	tableCount += 1
+	// 使用goroutine并发的创建多个表
+	var colTotal int
+	pgCreateTbl := "create table " + fmt.Sprintf("\"") + tblName + fmt.Sprintf("\"") + "("
+	// 查询当前表总共有多少个列字段
+	colTotalSql := fmt.Sprintf("select count(*) from information_schema.COLUMNS  where TABLE_CATALOG = DB_NAME() and table_name='%s'", tblName)
+	err := srcDb.QueryRow(colTotalSql).Scan(&colTotal)
+	if err != nil {
+		log.Error(err)
+	}
+	// 查询sql server表结构
+	sql := fmt.Sprintf("SELECT \n    '\"' + LOWER(c.COLUMN_NAME) + '\"' AS column_name,\n    c.DATA_TYPE,\n    ISNULL(CAST(c.CHARACTER_MAXIMUM_LENGTH AS VARCHAR(10)), 'null') CHARACTER_MAXIMUM_LENGTH,\n    c.IS_NULLABLE,\n    CASE \n        WHEN c.COLUMN_DEFAULT = '( ''user'' )' THEN 'user'\n        ELSE ISNULL(c.COLUMN_DEFAULT, 'null')\n    END AS column_default,\n    ISNULL(CAST(c.NUMERIC_PRECISION AS VARCHAR(10)), 'null') NUMERIC_PRECISION,\n    ISNULL(CAST(c.NUMERIC_SCALE AS VARCHAR(10)), 'null') NUMERIC_SCALE,\n    ISNULL(CAST(c.DATETIME_PRECISION AS VARCHAR(10)), 'null') DATETIME_PRECISION,\n    ISNULL(\n        CASE \n            WHEN EXISTS (\n                SELECT 1 \n                FROM sys.indexes i \n                JOIN sys.index_columns ic ON i.object_id = ic.object_id \n                WHERE i.is_primary_key = 1 \n                AND ic.column_id = sc.column_id\n                AND sc.object_id = st.object_id\n            ) THEN 'PRI'\n            WHEN EXISTS (\n                SELECT 1 \n                FROM sys.indexes i \n                JOIN sys.index_columns ic ON i.object_id = ic.object_id \n                WHERE i.is_unique = 1 AND i.is_primary_key = 0\n                AND ic.column_id = sc.column_id\n                AND sc.object_id = st.object_id\n            ) THEN 'UNI'\n            ELSE 'null'\n        END, 'null'\n    ) AS column_key,\n    ISNULL(\n        (SELECT value FROM sys.extended_properties \n         WHERE major_id = st.object_id \n         AND minor_id = sc.column_id \n         AND name = 'MS_Description'), 'null'\n    ) AS column_comment,\n    c.ORDINAL_POSITION\nFROM \n    INFORMATION_SCHEMA.COLUMNS c\nJOIN \n    sys.tables st ON c.TABLE_NAME = st.name\nJOIN \n    sys.columns sc ON st.object_id = sc.object_id \n                  AND c.COLUMN_NAME = sc.name\nWHERE \n    c.TABLE_CATALOG = DB_NAME() \n    AND c.TABLE_NAME = '%s'\nORDER BY \n    c.ORDINAL_POSITION;", tblName)
+	//fmt.Println(sql)
+	rows, err := srcDb.Query(sql)
+	if err != nil {
+		log.Error(err)
+	}
+	// 遍历MySQL表字段,一行就是一个字段的基本信息
+	for rows.Next() {
+		if err := rows.Scan(&newTable.columnName, &newTable.dataType, &newTable.characterMaximumLength, &newTable.isNullable, &newTable.columnDefault, &newTable.numericPrecision, &newTable.numericScale, &newTable.datetimePrecision, &newTable.columnKey, &newTable.columnComment, &newTable.ordinalPosition); err != nil {
+			log.Error(err)
+		}
+		//fmt.Println(columnName,dataType,characterMaximumLength,isNullable,columnDefault,numericPrecision,numericScale,datetimePrecision,columnKey,columnComment,ordinalPosition)
+		//适配MySQL字段类型到PostgreSQL字段类型
+		// 列字段是否允许null
+		switch newTable.isNullable {
+		case "NO":
+			newTable.destNullable = "not null"
+		default:
+			newTable.destNullable = "null"
+		}
+		// 列字段default默认值的处理
+		switch {
+		case strings.ToUpper(newTable.columnDefault) == "NULL", strings.ToUpper(newTable.columnDefault) == "(NULL)": // 默认值不是null并且是字符串类型下面就需要使用fmt.Sprintf格式化让字符串单引号包围，否则这个字符串是没有引号包围的
+			if newTable.dataType == "varchar" || newTable.dataType == "nvarchar" {
+				newTable.destDefault = ""
+			} else if newTable.dataType == "char" {
+				newTable.destDefault = ""
+			} else {
+				newTable.destDefault = fmt.Sprintf("default %s", newTable.columnDefault)
+			}
+		default: // (N'0')
+			newTable.destDefault = strings.TrimSpace(newTable.destDefault)
+			newTable.destDefault = strings.ReplaceAll(newTable.destDefault, "(", "")
+			newTable.destDefault = strings.ReplaceAll(newTable.destDefault, ")", "")
+			newTable.destDefault = strings.ReplaceAll(newTable.destDefault, "N'0'", "0")
+		}
+		// 列字段类型的处理
+		switch newTable.dataType {
+		case "int", "mediumint", "tinyint", "bigint":
+			newTable.destType = "int"
+		case "varchar", "nvarchar":
+			if strings.ToUpper(viper.GetString("charInLength")) == "TRUE" { // charInLength指定后，使用varchar(100 char)这种形式
+				newTable.destType = "varchar(" + newTable.characterMaximumLength + " char)"
+			} else {
+				newTable.destType = "varchar(" + newTable.characterMaximumLength + ")" // 常规varchar
+			}
+			if strings.ToUpper(viper.GetString("useNvarchar2")) == "TRUE" { // 一旦useNvarchar2指定后，后面都会使用nvarchar2类型，比如GaussDB支持以字符长度作为单位
+				newTable.destType = "nvarchar2(" + newTable.characterMaximumLength + ")"
+				if newTable.characterMaximumLength == "-1" {
+					newTable.destType = "nvarchar2"
+				}
+			}
+		case "char", "nchar":
+			if strings.ToUpper(viper.GetString("charInLength")) == "TRUE" {
+				newTable.destType = "char(" + newTable.characterMaximumLength + " char)"
+			} else {
+				newTable.destType = "char(" + newTable.characterMaximumLength + ")"
+			}
+		case "varbinary":
+			if newTable.characterMaximumLength == "-1" {
+				newTable.destType = "bytea"
+			} else {
+				newTable.destType = "varbinary(" + newTable.characterMaximumLength + ")"
+				//clen, _ := strconv.Atoi(newTable.characterMaximumLength.String)
+				//if clen > 2000 {
+				//	newTable.destType = "longblob"
+				//} else {
+				//	newTable.destType = "varbinary(" + newTable.characterMaximumLength.String + ")"
+				//}
+			}
+		case "binary":
+			//newTable.destType = "binary(" + newTable.characterMaximumLength + ")"
+			newTable.destType = "int"
+		case "text", "ntext":
+			newTable.destType = "text"
+		case "image":
+			newTable.destType = "bytea"
+		case "bit":
+			newTable.destType = "tinyint"
+		case "uniqueidentifier":
+			//newTable.destType = "binary(16)"
+			newTable.destType = "char(36)"
+		case "smalldatetime":
+			newTable.destType = "datetime"
+		//case "datetime2": //yyyy-MM-dd HH:mm:ss.fffffff 精确到0.1微秒
+		//	newTable.destType = "datetime(6)"
+		case "datetime", "datetime2":
+			newTable.destType = "timestamp"
+		case "timestamp":
+			newTable.destType = "datetime"
+		case "numeric", "decimal", "money", "smallmoney", "real":
+			if newTable.numericScale == "null" {
+				newTable.destType = "decimal(" + newTable.numericPrecision + ")"
+			} else {
+				newTable.destType = "decimal(" + newTable.numericPrecision + "," + newTable.numericScale + ")"
+			}
+		case "double":
+			newTable.destType = "double precision"
+		case "float":
+			newTable.destType = "double precision"
+		case "tinyblob", "blob", "mediumblob", "longblob":
+			newTable.destType = "bytea"
+		// 其余类型，源库使用什么类型，目标库就使用什么类型
+		default:
+			newTable.destType = newTable.dataType
+		}
+		// 在目标库创建的语句
+		pgCreateTbl += fmt.Sprintf("%s %s %s %s,", newTable.columnName, newTable.destType, newTable.destNullable, newTable.destDefault)
+		if newTable.ordinalPosition == colTotal {
+			pgCreateTbl = pgCreateTbl[:len(pgCreateTbl)-1] + ")" // 最后一个列字段结尾去掉逗号,并且加上语句的右括号
+		}
+	}
+	//fmt.Println(pgCreateTbl) // 打印创建表语句
+	// 创建前先删除目标表
+	dropDestTbl := "drop table if exists " + fmt.Sprintf("\"") + tblName + fmt.Sprintf("\"") + " cascade"
+	if _, err = destDb.Exec(dropDestTbl); err != nil {
+		log.Error("drop table ", tblName, " failed ", err)
+	}
+	// 创建PostgreSQL表结构
+	log.Info(fmt.Sprintf("%v Table total %s create table %s", time.Now().Format("2006-01-02 15:04:05.000000"), strconv.Itoa(tableCount), tblName))
+	if _, err = destDb.Exec(pgCreateTbl); err != nil {
+		log.Error("table ", tblName, " create failed  ", err)
+		LogError(logDir, "tableCreateFailed", pgCreateTbl, err)
+		failedCount += 1
+	}
+	<-ch
+}
+
+func (tb *Table) SeqCreate(logDir string) (result []string) {
+	startTime := time.Now()
+	tableCount := 0
+	failedCount := 0
+	var tableName string
+	// 查询MySQL自增列信息，批量生成创建序列sql
+	sql := fmt.Sprintf("SELECT \n    lower(t.name) AS table_name,\n    lower(c.name) AS column_name,\n    ic.seed_value AS auto_increment,\n    lower('drop sequence if exists seq_' + t.name + '_' + c.name + ';') AS drop_seq,\n    lower('create sequence seq_' + t.name + '_' + c.name + ' INCREMENT BY 1 START WITH ' + CAST(ic.seed_value AS VARCHAR(20)) + ';') AS create_seq,\n    lower('alter table ' + t.name + ' alter column ' + c.name + ' set default nextval(''seq_' + t.name + '_' + c.name + ''') ' + ';') AS alter_default\nFROM sys.tables t\nJOIN sys.columns c ON t.object_id = c.object_id\nJOIN sys.identity_columns ic ON t.object_id = ic.object_id AND c.column_id = ic.column_id\nWHERE t.is_ms_shipped = 0")
+	//fmt.Println(sql)
+	rows, err := srcDb.Query(sql)
+	if err != nil {
+		log.Error(err)
+	}
+	// 从sql结果集遍历，获取到删除序列，创建序列，默认值为自增列
+	for rows.Next() {
+		tableCount += 1
+		if err := rows.Scan(&tableName, &tb.columnName, &tb.autoIncrement, &tb.dropSeqSql, &tb.destSeqSql, &tb.destDefaultSeq); err != nil {
+			log.Error(err)
+		}
+		// 创建前先删除目标序列
+		if _, err = destDb.Exec(tb.dropSeqSql); err != nil {
+			log.Error(err)
+		}
+		// 创建目标序列
+		log.Info(fmt.Sprintf("%v ProcessingID %s create sequence %s", time.Now().Format("2006-01-02 15:04:05.000000"), strconv.Itoa(tableCount), tableName))
+		if _, err = destDb.Exec(tb.destSeqSql); err != nil {
+			log.Error("table ", tableName, " create sequence failed ", err)
+			LogError(logDir, "seqCreateFailed", tb.destSeqSql, err)
+			failedCount += 1
+		}
+		// 设置表自增列为序列，如果表不存并单独创建序列会有error但是毫无影响
+		log.Info(fmt.Sprintf("%v ProcessingID %s set default sequence %s", time.Now().Format("2006-01-02 15:04:05.000000"), strconv.Itoa(tableCount), tableName))
+		if _, err = destDb.Exec(tb.destDefaultSeq); err != nil {
+			log.Error("table ", tableName, " set default sequence failed ", err)
+			LogError(logDir, "seqCreateFailed", tb.destDefaultSeq, err)
+			failedCount += 1
+		}
+	}
+	endTime := time.Now()
+	cost := time.Since(startTime)
+	result = append(result, "Sequence", startTime.Format("2006-01-02 15:04:05.000000"), endTime.Format("2006-01-02 15:04:05.000000"), strconv.Itoa(failedCount), cost.String())
+	log.Info("sequence count ", tableCount)
+	return result
+}
+
+func (tb *Table) IdxCreate(logDir string, excludeTable []string) (result []string) {
+	startTime := time.Now()
+	failedCount := 0
+	id := 0
+	var sql, excludeSql string
+	if excludeTable != nil {
+		for _, tabName := range excludeTable {
+			if strings.Contains(tabName, "*") {
+				tabName = strings.ReplaceAll(tabName, "*", "%")
+				excludeSql += " and table_name not like '" + tabName + "'"
+			} else {
+				excludeSql += " and table_name not like '" + tabName + "'"
+			}
+
+		}
+		sql = fmt.Sprintf("with indexcolumns as (\n    select \n        ixc.object_id,\n        ixc.index_id,\n        stuff((\n            select ', ' + c2.name\n            from sys.index_columns ixc2\n            join sys.columns c2 on ixc2.object_id = c2.object_id and ixc2.column_id = c2.column_id\n            where ixc2.object_id = ixc.object_id and ixc2.index_id = ixc.index_id\n            order by ixc2.key_ordinal\n            for xml path(''), type).value('.', 'nvarchar(max)'), 1, 2, '') as column_list\n    from sys.index_columns ixc\n    group by ixc.object_id, ixc.index_id\n)\nselect \n    case \n        when i.is_primary_key = 1 then\n            'alter table ' + lower(t.name) + \n            ' add  primary key ' + \n            case when i.type_desc = 'nonclustered' then '' else '' end + \n            '(' + lower(ic.column_list) + ');'\n        when i.is_unique = 1 and i.is_primary_key = 0 then\n            'create unique  index ' + lower(i.name) + '_' + \n            substring(replace(cast(newid() as varchar(36)), '-', ''), 1, 8) + \n            ' on ' + lower(t.name) + \n            '(' + lower(ic.column_list) + ');'\n        else\n            'create  index ' + replace(lower(i.name),'-','_') + '_' + \n            substring(replace(cast(newid() as varchar(36)), '-', ''), 1, 8) + \n            ' on ' + lower(t.name) + \n            '(' + lower(ic.column_list) + ');'\n    end as sql_text,\n    lower(i.name) as index_name,\n    'alter table ' + lower(t.name) + ' distribute by hash (' + lower(ic.column_list) + ');' as distribute_sql\nfrom sys.tables t\njoin sys.indexes i on t.object_id = i.object_id\njoin indexcolumns ic on t.object_id = ic.object_id and i.index_id = ic.index_id\nwhere t.is_ms_shipped = 0\n    and i.type > 0\ngroup by t.name, i.name, i.is_primary_key, i.is_unique, i.type_desc, ic.column_list\norder by t.name, i.name;")
+	} else {
+		sql = fmt.Sprintf("with indexcolumns as (\n    select \n        ixc.object_id,\n        ixc.index_id,\n        stuff((\n            select ', ' + c2.name\n            from sys.index_columns ixc2\n            join sys.columns c2 on ixc2.object_id = c2.object_id and ixc2.column_id = c2.column_id\n            where ixc2.object_id = ixc.object_id and ixc2.index_id = ixc.index_id\n            order by ixc2.key_ordinal\n            for xml path(''), type).value('.', 'nvarchar(max)'), 1, 2, '') as column_list\n    from sys.index_columns ixc\n    group by ixc.object_id, ixc.index_id\n)\nselect \n    case \n        when i.is_primary_key = 1 then\n            'alter table ' + lower(t.name) + \n            ' add  primary key ' + \n            case when i.type_desc = 'nonclustered' then '' else '' end + \n            '(' + lower(ic.column_list) + ');'\n        when i.is_unique = 1 and i.is_primary_key = 0 then\n            'create unique  index ' + lower(i.name) + '_' + \n            substring(replace(cast(newid() as varchar(36)), '-', ''), 1, 8) + \n            ' on ' + lower(t.name) + \n            '(' + lower(ic.column_list) + ');'\n        else\n            'create  index ' + replace(lower(i.name),'-','_') + '_' + \n            substring(replace(cast(newid() as varchar(36)), '-', ''), 1, 8) + \n            ' on ' + lower(t.name) + \n            '(' + lower(ic.column_list) + ');'\n    end as sql_text,\n    lower(i.name) as index_name,\n    'alter table ' + lower(t.name) + ' distribute by hash (' + lower(ic.column_list) + ');' as distribute_sql\nfrom sys.tables t\njoin sys.indexes i on t.object_id = i.object_id\njoin indexcolumns ic on t.object_id = ic.object_id and i.index_id = ic.index_id\nwhere t.is_ms_shipped = 0\n    and i.type > 0\ngroup by t.name, i.name, i.is_primary_key, i.is_unique, i.type_desc, ic.column_list\norder by t.name, i.name;")
+	}
+	// 查询MySQL索引、主键、唯一约束等信息，批量生成创建语句
+	fmt.Println("create index: ", sql)
+	rows, err := srcDb.Query(sql)
+	if err != nil {
+		log.Error(err)
+	}
+	// 从sql结果集遍历，获取到创建语句
+	for rows.Next() {
+		var indexName, alterDistributeSql string
+		id += 1
+		if err := rows.Scan(&tb.destIdxSql, &indexName, &alterDistributeSql); err != nil {
+			log.Error(err)
+		}
+		// 如果是分布式数据库，先更改分布列，这里挑选主键作为分布列,避免之前创建表没指定主键，某些数据库会自动挑选分布列，后面再加主键会遇到主键没包括分布列的问题
+		if strings.ToUpper(viper.GetString("Distributed")) == "TRUE" {
+			if indexName == "PRIMARY" {
+				if _, err = destDb.Exec(alterDistributeSql); err != nil {
+					log.Error(alterDistributeSql, " alter table DISTRIBUTE failed ", err)
+					LogError(logDir, "DistributedAlterFailed", tb.destIdxSql, err)
+					failedCount += 1
+				}
+			}
+		}
+		// 不管是不是分布式数据库，下面的主键都会创建
+		log.Info(fmt.Sprintf("%v ProcessingID %s %s", time.Now().Format("2006-01-02 15:04:05.000000"), strconv.Itoa(id), tb.destIdxSql))
+		if _, err = destDb.Exec(tb.destIdxSql); err != nil {
+			log.Error("index ", tb.destIdxSql, " create index failed ", err)
+			LogError(logDir, "idxCreateFailed", tb.destIdxSql, err)
+			failedCount += 1
+		}
+	}
+	endTime := time.Now()
+	cost := time.Since(startTime)
+	log.Info("index  count ", id)
+	result = append(result, "Index", startTime.Format("2006-01-02 15:04:05.000000"), endTime.Format("2006-01-02 15:04:05.000000"), strconv.Itoa(failedCount), cost.String())
+	return result
+}
+
+func (tb *Table) FKCreate(logDir string) (result []string) {
+	failedCount := 0
+	startTime := time.Now()
+	id := 0
+	var createSql string
+	var fkTable string
+	// 查询MySQL外键，批量生成创建语句
+	//sql := fmt.Sprintf("SELECT ifnull(concat('ALTER TABLE \"',K.TABLE_NAME,'\" ADD CONSTRAINT ',K.CONSTRAINT_NAME,' FOREIGN KEY(',GROUP_CONCAT(COLUMN_NAME),')',' REFERENCES \"',K.REFERENCED_TABLE_NAME,'\"(',GROUP_CONCAT(REFERENCED_COLUMN_NAME),')',' ON DELETE ',DELETE_RULE,' ON UPDATE ',UPDATE_RULE),'null') FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE k INNER JOIN INFORMATION_SCHEMA.REFERENTIAL_CONSTRAINTS r on k.CONSTRAINT_NAME = r.CONSTRAINT_NAME where k.CONSTRAINT_SCHEMA =database() AND r.CONSTRAINT_SCHEMA=database()  and k.REFERENCED_TABLE_NAME is not null order by k.ORDINAL_POSITION;")
+	// 先获取有外键的表名
+	sql := fmt.Sprintf("select  table_name from INFORMATION_SCHEMA.REFERENTIAL_CONSTRAINTS where CONSTRAINT_SCHEMA =database();")
+	//fmt.Println(sql)
+	rows, err := srcDb.Query(sql)
+	if err != nil {
+		log.Error(err)
+	}
+	// 从sql结果集遍历，获取到单个表外键的创建语句
+	for rows.Next() {
+		id += 1
+		if err := rows.Scan(&fkTable); err != nil {
+			log.Error(err)
+		}
+		sql = fmt.Sprintf("SELECT ifnull(concat('ALTER TABLE \"',K.TABLE_NAME,'\" ADD CONSTRAINT ',K.CONSTRAINT_NAME,' FOREIGN KEY(',GROUP_CONCAT(COLUMN_NAME),')',' REFERENCES \"',K.REFERENCED_TABLE_NAME,'\"(',GROUP_CONCAT(REFERENCED_COLUMN_NAME),')',' ON DELETE ',DELETE_RULE,' ON UPDATE ',UPDATE_RULE),'null') FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE k INNER JOIN INFORMATION_SCHEMA.REFERENTIAL_CONSTRAINTS r on k.CONSTRAINT_NAME = r.CONSTRAINT_NAME where k.CONSTRAINT_SCHEMA =database() AND r.CONSTRAINT_SCHEMA=database()  and k.REFERENCED_TABLE_NAME is not null and k.table_name='%s'  order by k.ORDINAL_POSITION;", fkTable)
+		err := srcDb.QueryRow(sql).Scan(&createSql) // 根据单个表获取外键拼接sql
+		if err != nil {
+			log.Error(err)
+		}
+		// 创建目标外键
+		if createSql != "null" {
+			log.Info(fmt.Sprintf("%v ProcessingID %s create foreign key %s", time.Now().Format("2006-01-02 15:04:05.000000"), strconv.Itoa(id), createSql))
+			if _, err = destDb.Exec(createSql); err != nil {
+				log.Error(createSql, " create foreign key failed ", err)
+				LogError(logDir, "FkCreateFailed", createSql, err)
+				failedCount += 1
+			}
+		}
+	}
+	log.Info("foreign key count ", id)
+	endTime := time.Now()
+	cost := time.Since(startTime)
+	result = append(result, "ForeignKey", startTime.Format("2006-01-02 15:04:05.000000"), endTime.Format("2006-01-02 15:04:05.000000"), strconv.Itoa(failedCount), cost.String())
+	return result
+}
+
+func (tb *Table) ViewCreate(logDir string) (result []string) {
+	failedCount := 0
+	startTime := time.Now()
+	id := 0
+	var viewName string
+	// 查询视图并拼接生成目标数据库创建视图的SQL
+	sql := fmt.Sprintf("SELECT \n    lower(name),REPLACE(\n        REPLACE(\n            REPLACE(\n                REPLACE(\n                    REPLACE(REPLACE(LOWER(definition),'dbo.',''), '  ', ' '),\n                'CREATE VIEW', 'CREATE OR REPLACE VIEW'),\n            '[dbo].', ''),\n        '[', ''),\n    ']', '') AS view_create\nFROM sys.views v\nJOIN sys.sql_modules m ON v.object_id = m.object_id\nWHERE m.definition IS NOT NULL;")
+	rows, err := srcDb.Query(sql)
+	if err != nil {
+		log.Error(err)
+	}
+	// 从sql结果集遍历，获取到创建语句
+	for rows.Next() {
+		id += 1
+		if err := rows.Scan(&viewName, &tb.viewSql); err != nil {
+			log.Error(err)
+		}
+		// 创建目标视图
+		log.Info(fmt.Sprintf("%v ProcessingID %s create view %s", time.Now().Format("2006-01-02 15:04:05.000000"), strconv.Itoa(id), viewName))
+		if _, err = destDb.Exec(tb.viewSql); err != nil {
+			log.Error("view ", viewName, " create view failed ", err)
+			//err = nil
+			LogError(logDir, "viewCreateFailed", tb.viewSql, err)
+			failedCount += 1
+		}
+	}
+	log.Info("view total ", id)
+	endTime := time.Now()
+	cost := time.Since(startTime)
+	result = append(result, "View", startTime.Format("2006-01-02 15:04:05.000000"), endTime.Format("2006-01-02 15:04:05.000000"), strconv.Itoa(failedCount), cost.String())
+	return result
+}
+
+func (tb *Table) TriggerCreate(logDir string) (result []string) {
+	id := 0
+	failedCount := 0
+	startTime := time.Now()
+	var createSql string
+	// 查询触发器，批量生成创建语句
+	sql := fmt.Sprintf("SELECT replace(lower(concat('create or replace trigger ',trigger_name,' ',action_timing,' ',event_manipulation,' on \"',event_object_table,'\" for each row as ',action_statement)),'#','-- ') FROM information_schema.triggers WHERE trigger_schema=database();")
+	//fmt.Println(sql)
+	rows, err := srcDb.Query(sql)
+	if err != nil {
+		log.Error(err)
+	}
+	// 从sql结果集遍历，获取到创建语句
+	for rows.Next() {
+		id += 1
+		if err := rows.Scan(&createSql); err != nil {
+			log.Error(err)
+		}
+		// 创建目标触发器
+		log.Info(fmt.Sprintf("%v ProcessingID %s create trigger %s", time.Now().Format("2006-01-02 15:04:05.000000"), strconv.Itoa(id), createSql))
+		if _, err = destDb.Exec(createSql); err != nil {
+			log.Error(createSql, " create trigger failed ", err)
+			LogError(logDir, "TriggerCreateFailed", createSql, err)
+			failedCount += 1
+		}
+	}
+	log.Info("trigger count ", id)
+	endTime := time.Now()
+	cost := time.Since(startTime)
+	result = append(result, "Trigger", startTime.Format("2006-01-02 15:04:05.000000"), endTime.Format("2006-01-02 15:04:05.000000"), strconv.Itoa(failedCount), cost.String())
+	return result
+}
+
+// TableCreate 单线程创建表
+//func (tb *Table) TableCreate(logDir string, tableMap map[string][]string) (result []string) {
+//	tableCount := 0
+//	startTime := time.Now()
+//	failedCount := 0
+//	// 获取tableMap键值对中的表名
+//	for tblName, _ := range tableMap {
+//		var colTotal int
+//		tableCount += 1
+//		pgCreateTbl := "create table " + tblName + "("
+//		// 查询当前表总共有多少个列字段
+//		colTotalSql := fmt.Sprintf("select count(*) from information_schema.COLUMNS  where table_schema=database() and table_name='%s'", tblName)
+//		err := srcDb.QueryRow(colTotalSql).Scan(&colTotal)
+//		if err != nil {
+//			log.Error(err)
+//		}
+//		// 查询MySQL表结构
+//		sql := fmt.Sprintf("select concat('\"',lower(column_name),'\"'),data_type,ifnull(character_maximum_length,'null'),is_nullable,case  column_default when '( \\'user\\' )' then 'user' else ifnull(column_default,'null') end as column_default,ifnull(numeric_precision,'null'),ifnull(numeric_scale,'null'),ifnull(datetime_precision,'null'),ifnull(column_key,'null'),ifnull(column_comment,'null'),ORDINAL_POSITION from information_schema.COLUMNS where table_schema=database() and table_name='%s'", tblName)
+//		//fmt.Println(sql)
+//		rows, err := srcDb.Query(sql)
+//		if err != nil {
+//			log.Error(err)
+//		}
+//		// 遍历MySQL表字段,一行就是一个字段的基本信息
+//		for rows.Next() {
+//			if err := rows.Scan(&tb.columnName, &tb.dataType, &tb.characterMaximumLength, &tb.isNullable, &tb.columnDefault, &tb.numericPrecision, &tb.numericScale, &tb.datetimePrecision, &tb.columnKey, &tb.columnComment, &tb.ordinalPosition); err != nil {
+//				log.Error(err)
+//			}
+//			//fmt.Println(columnName,dataType,characterMaximumLength,isNullable,columnDefault,numericPrecision,numericScale,datetimePrecision,columnKey,columnComment,ordinalPosition)
+//			//适配MySQL字段类型到PostgreSQL字段类型
+//			// 列字段是否允许null
+//			switch tb.isNullable {
+//			case "NO":
+//				tb.destNullable = "not null"
+//			default:
+//				tb.destNullable = "null"
+//			}
+//			// 列字段default默认值的处理
+//			switch {
+//			case tb.columnDefault != "null": // 默认值不是null并且是字符串类型下面就需要使用fmt.Sprintf格式化让字符串单引号包围，否则这个字符串是没有引号包围的
+//				if tb.dataType == "varchar" {
+//					tb.destDefault = fmt.Sprintf("default '%s'", tb.columnDefault)
+//				} else if tb.dataType == "char" {
+//					tb.destDefault = fmt.Sprintf("default '%s'", tb.columnDefault)
+//				} else {
+//					tb.destDefault = fmt.Sprintf("default %s", tb.columnDefault) // 非字符串类型无需使用单引号包围
+//				}
+//			default:
+//				tb.destDefault = "" // 如果没有默认值，默认值就是空字符串，即目标没有默认值
+//			}
+//			// 列字段类型的处理
+//			switch tb.dataType {
+//			case "int", "mediumint", "tinyint":
+//				tb.destType = "int"
+//			case "varchar":
+//				tb.destType = "varchar(" + tb.characterMaximumLength + ")"
+//			case "char":
+//				tb.destType = "char(" + tb.characterMaximumLength + ")"
+//			case "text", "tinytext", "mediumtext", "longtext":
+//				tb.destType = "text"
+//			case "datetime", "timestamp":
+//				tb.destType = "timestamp"
+//			case "decimal", "double", "float":
+//				if tb.numericScale == "null" {
+//					tb.destType = "decimal(" + tb.numericPrecision + ")"
+//				} else {
+//					tb.destType = "decimal(" + tb.numericPrecision + "," + tb.numericScale + ")"
+//				}
+//			case "tinyblob", "blob", "mediumblob", "longblob":
+//				tb.destType = "bytea"
+//			// 其余类型，源库使用什么类型，目标库就使用什么类型
+//			default:
+//				tb.destType = tb.dataType
+//			}
+//			// 在目标库创建的语句
+//			pgCreateTbl += fmt.Sprintf("%s %s %s %s,", tb.columnName, tb.destType, tb.destNullable, tb.destDefault)
+//			if tb.ordinalPosition == colTotal {
+//				pgCreateTbl = pgCreateTbl[:len(pgCreateTbl)-1] + ")" // 最后一个列字段结尾去掉逗号,并且加上语句的右括号
+//			}
+//		}
+//		//fmt.Println(pgCreateTbl) // 打印创建表语句
+//		// 创建前先删除目标表
+//		dropDestTbl := "drop table if exists " + tblName + " cascade"
+//		if _, err = destDb.Exec(dropDestTbl); err != nil {
+//			log.Error(err)
+//		}
+//		// 创建PostgreSQL表结构
+//		log.Info("Processing ID " + strconv.Itoa(tableCount) + " create table " + tblName)
+//		if _, err = destDb.Exec(pgCreateTbl); err != nil {
+//			log.Error("table ", tblName, " create failed", err)
+//			failedCount += 1
+//			LogError(logDir, "tableCreateFailed", pgCreateTbl, err)
+//		}
+//	}
+//	endTime := time.Now()
+//	cost := time.Since(startTime)
+//	log.Info("Table structure synced from MySQL to PostgreSQL ,Source Table Total ", tableCount, " Failed Total ", strconv.Itoa(failedCount))
+//	result = append(result, "Table", startTime.Format("2006-01-02 15:04:05.000000"), endTime.Format("2006-01-02 15:04:05.000000"), strconv.Itoa(failedCount), cost.String())
+//	return result
+//}
