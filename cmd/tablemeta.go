@@ -97,8 +97,10 @@ func (tb *Table) TableCreate(logDir string, tblName string, ch chan struct{}) {
 		}
 		// 列字段类型的处理
 		switch newTable.dataType {
-		case "int", "mediumint", "tinyint", "bigint":
+		case "int", "mediumint", "tinyint", "smallint":
 			newTable.destType = "int"
+		case "bigint":
+			newTable.destType = "bigint"
 		case "varchar", "nvarchar":
 			if strings.ToUpper(viper.GetString("charInLength")) == "TRUE" { // charInLength指定后，使用varchar(100 char)这种形式
 				newTable.destType = "varchar(" + newTable.characterMaximumLength + " char)"

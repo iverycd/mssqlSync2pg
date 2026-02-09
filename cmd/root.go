@@ -638,12 +638,16 @@ func runMigration(logDir string, startPage int, tableName string, sqlStr string,
 			if colValue == nil {
 				value = nil //空值判断
 			} else {
-				if colType[i] == "BLOB" { //大字段类型就无需使用string函数转为字符串类型，即使用sql.RawBytes类型
+				if colType[i] == "BLOB" || colType[i] == "VARBINARY" || colType[i] == "IMAGE" { //大字段类型就无需使用string函数转为字符串类型，即使用sql.RawBytes类型
 					value = colValue
 				} else if colType[i] == "GEOMETRY" { //gis类型的数据处理
 					value = hex.EncodeToString(colValue)[8:] //golang把gis类型列数据转成16进制字符串后，会在开头多出来8个0，所以下面进行截取，从第9位开始获取数据
-				} else if colType[i] == "BIT" {
-					value = hex.EncodeToString(colValue)[1:] //mysql中获取bit类型转为16进制是00或者01,但是在pgsql中如果只需要1位类型为bit(1)，那么就从第1位后面开始截取数据
+				} else if colType[i] == "BIT" { // sql server的bit类型会被go识别为bool，所以这里手动映射为int类型的值
+					if string(colValue) == "1" || strings.ToUpper(string(colValue)) == "TRUE" {
+						value = 1
+					} else {
+						value = 0
+					}
 				} else {
 					value = string(colValue) //非大字段类型,显式使用string函数强制转换为字符串文本，否则都是字节类型文本(即sql.RawBytes)
 				}
