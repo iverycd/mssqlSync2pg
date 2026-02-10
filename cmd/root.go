@@ -698,10 +698,10 @@ func runMigration(logDir string, startPage int, tableName string, sqlStr string,
 	}
 	_, err = stmt.Exec() //把所有的buffer进行flush，一次性写入数据
 	if err != nil {
-		log.Error("prepareValues Error PG Copy Failed: ", tableName, " ", err) //注意这里不能使用Fatal，否则会直接退出程序，也就没法遇到错误继续了
+		log.Error("prepareValues Error PG Copy Failed: ", tableName, " ", err.Error()) //注意这里不能使用Fatal，否则会直接退出程序，也就没法遇到错误继续了
 		LogAlterSql(logDir, "failedTable", tableName)
 		// 在copy过程中异常的表，将异常信息输出到平面文件
-		LogError(logDir, "errorTableData", StrVal(prepareValues), err)
+		LogError(logDir, "errorTableData", "", err)
 		//ch <- 2
 		// 通过外部的全局变量通道获取到迁移行数据失败的计数
 		responseChannel <- fmt.Sprintf("data error %s", tableName)
