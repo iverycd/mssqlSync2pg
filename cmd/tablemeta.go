@@ -3,6 +3,7 @@ package cmd
 import (
 	"fmt"
 	"github.com/spf13/viper"
+	"mssqlSync2pg/convert_sql"
 	"strconv"
 	"strings"
 	"time"
@@ -350,7 +351,13 @@ func (tb *Table) ViewCreate(logDir string) (result []string) {
 		if err := rows.Scan(&viewName, &tb.viewSql); err != nil {
 			log.Error(err)
 		}
-		// 创建目标视图
+		// 创建目标视图前自动转换sql server的convert函数为pgsql的::数据类型
+		tb.viewSql = strings.ReplaceAll(convert_sql.ConvertView1(tb.viewSql), "+", "||")
+		tb.viewSql = convert_sql.ConvertView2(tb.viewSql)
+		tb.viewSql = convert_sql.ConvertView3(tb.viewSql)
+		tb.viewSql = convert_sql.ConvertView4(tb.viewSql)
+		tb.viewSql = convert_sql.ConvertView5(tb.viewSql)
+		tb.viewSql = convert_sql.ConvertView6(tb.viewSql)
 		log.Info(fmt.Sprintf("%v ProcessingID %s create view %s", time.Now().Format("2006-01-02 15:04:05.000000"), strconv.Itoa(id), viewName))
 		if _, err = destDb.Exec(tb.viewSql); err != nil {
 			log.Error("view ", viewName, " create view failed ", err)
