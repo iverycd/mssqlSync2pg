@@ -158,7 +158,7 @@ func ConvertView6(input string) string {
 	// \s*,\s* - 逗号分隔符
 	// ([^,]+) - 捕获组1：任意字符串（不含逗号）
 	// \s*,\s*120\s*\) - 匹配",120)"
-	pattern := `(?i)\bconvert\s*\(\s*varchar\s*\(\s*\d+\s*\)\s*,\s*([^,]+)\s*,\s*120\s*\)`
+	pattern := `(?i)convert\s*\(\s*varchar\s*(?:\(\d+\))?\s*,\s*([^,]+?)\s*,\s*120\s*\)`
 
 	re := regexp.MustCompile(pattern)
 
