@@ -180,13 +180,34 @@ INFO[0040] Table Compare finish elapsed time 11.307881434s
 
 
 
+### 2.5 FAQ
+1、如果在日志`errorTableData.log`有类似报错`The null value in column \"rowguid\" violates the not-null constraint.`说明这个字段是空字符串`''`，可以后期使用自定义查询sql单独迁移，
+比如如下配置文件`example.yml`
 
-### 2.4 其他迁移模式
+```shell
+dest:
+  dbType: Gauss
+  host: 192.168.1.200
+  port: 8000
+  database: test
+  username: test
+  password: 11111
+pageSize: 100000
+maxParallel: 30
+charInLength: false
+useNvarchar2: false
+Distributed: false
+tables:
+  test:
+    - select * from test where rowguid !='' # 通过where条件,排除掉异常数据
+```
+
+## 三、其他迁移模式
 
 除了迁移全库之外，工具还支持迁移部分数据库对象，如部分表结构，视图，自增列，索引等对象
 
 
-#### 2.4.1 全库迁移
+#### 3.1 全库迁移
 
 迁移全库表结构、行数据，视图、索引约束、自增列等对象
 
@@ -197,7 +218,7 @@ mssqlSync2pg.exe  --config 配置文件
 mssqlSync2pg.exe --config example.yml
 ```
 
-#### 2.4.2 自定义SQL查询迁移
+#### 3.2 自定义SQL查询迁移
 
 不迁移全库数据，只迁移部分表，根据配置文件中自定义查询语句迁移表结构和表数据到目标库
 
@@ -208,7 +229,7 @@ mssqlSync2pg.exe  --config 配置文件 -s
 mssqlSync2pg.exe  --config example.yml -s
 ```
 
-#### 2.4.3 迁移全库所有表结构
+#### 3.3 迁移全库所有表结构
 
 仅在目标库创建所有表的表结构
 
@@ -219,7 +240,7 @@ mssqlSync2pg.exe  --config 配置文件 createTable -t
 mssqlSync2pg.exe  --config example.yml createTable -t
 ```
 
-#### 2.4.4 迁移自定义表的表结构
+#### 3.4 迁移自定义表的表结构
 
 仅在目标库创建自定义的表
 
@@ -231,7 +252,7 @@ mssqlSync2pg.exe  --config example.yml createTable -s -t
 ```
 
 
-#### 2.4.5 迁移全库表数据
+#### 3.5 迁移全库表数据
 
 只迁移全库表行数据到目标库，仅行数据，不包括表结构
 
@@ -241,7 +262,7 @@ mssqlSync2pg.exe  --config 配置文件 onlyData
 mssqlSync2pg.exe  --config example.yml onlyData
 ```
 
-#### 2.4.6 迁移自定义表数据
+#### 3.6 迁移自定义表数据
 
 只迁移yml配置文件中自定义查询sql，仅行数据，不包括表结构
 
@@ -252,7 +273,7 @@ mssqlSync2pg.exe  --config 配置文件 onlyData -s
 mssqlSync2pg.exe  --config example.yml onlyData -s
 ```
 
-#### 2.4.7 迁移自增列到目标序列形式
+#### 3.7 迁移自增列到目标序列形式
 
 只迁移SqlServer的自增列转换为目标数据库序列
 
@@ -263,7 +284,7 @@ mssqlSync2pg.exe  --config 配置文件 seqOnly
 mssqlSync2pg.exe  --config example.yml seqOnly
 ```
 
-#### 2.4.8 迁移索引等约束
+#### 3.8 迁移索引等约束
 
 只迁移SqlServer的主键、索引这类对象到目标数据库
 
@@ -274,7 +295,7 @@ mssqlSync2pg.exe  --config 配置文件 idxOnly
 mssqlSync2pg.exe  --config example.yml idxOnly
 ```
 
-#### 2.4.9 迁移视图
+#### 3.9 迁移视图
 
 只迁移SqlServer的视图到目标数据库
 
